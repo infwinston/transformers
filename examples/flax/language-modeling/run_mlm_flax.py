@@ -43,7 +43,7 @@ import jax
 import jax.numpy as jnp
 import optax
 from flax import jax_utils, traverse_util
-from flax.training import train_state
+from flax.training import train_state, checkpoints
 from flax.training.common_utils import get_metrics, onehot, shard
 from huggingface_hub import Repository
 from transformers import (
@@ -60,6 +60,7 @@ from transformers import (
 )
 from transformers.utils import get_full_repo_name, send_example_telemetry
 
+import wandb
 
 MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_MASKED_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
@@ -106,6 +107,14 @@ class TrainingArguments:
         default=None, metadata={"help": "The name of the repository to keep in sync with the local `output_dir`."}
     )
     hub_token: str = field(default=None, metadata={"help": "The token to use to push to the Model Hub."})
+    ckpt_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "checkpoint path."
+            )
+        },
+    )
 
     def __post_init__(self):
         if self.output_dir is not None:
@@ -339,23 +348,29 @@ def generate_batch_splits(samples_idx: jnp.ndarray, batch_size: int) -> jnp.ndar
 
 def write_train_metric(summary_writer, train_metrics, train_time, step):
     summary_writer.scalar("train_time", train_time, step)
+    wandb.log({'step': step, 'train_time': train_time})
 
     train_metrics = get_metrics(train_metrics)
     for key, vals in train_metrics.items():
         tag = f"train_{key}"
         for i, val in enumerate(vals):
             summary_writer.scalar(tag, val, step - len(vals) + i + 1)
+        wandb.log({'step': step, tag: vals[-1]})
 
 
 def write_eval_metric(summary_writer, eval_metrics, step):
     for metric_name, value in eval_metrics.items():
         summary_writer.scalar(f"eval_{metric_name}", value, step)
+        wandb.log({'step': step, f"eval_{metric_name}": value})
 
 
 def main():
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
+
+    wandb.login()
+    wandb.init(project="tpu_run_mlm")
 
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
@@ -524,6 +539,7 @@ def main():
 
     max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
 
+    print('tokenizing...')
     if data_args.line_by_line:
         # When using line_by_line, we just tokenize each nonempty line.
         padding = "max_length" if data_args.pad_to_max_length else False
@@ -625,14 +641,14 @@ def main():
             config=config,
             seed=training_args.seed,
             dtype=getattr(jnp, model_args.dtype),
-            use_auth_token=True if model_args.use_auth_token else None,
+            # use_auth_token=True if model_args.use_auth_token else None,
         )
     else:
         model = FlaxAutoModelForMaskedLM.from_config(
             config,
             seed=training_args.seed,
             dtype=getattr(jnp, model_args.dtype),
-            use_auth_token=True if model_args.use_auth_token else None,
+            # use_auth_token=True if model_args.use_auth_token else None,
         )
 
     # Store some constant
@@ -687,6 +703,12 @@ def main():
     # Setup train state
     state = train_state.TrainState.create(apply_fn=model.__call__, params=model.params, tx=optimizer)
 
+    # SKY
+    if training_args.ckpt_path is not None:
+        print("restoring states...")
+        state = checkpoints.restore_checkpoint(ckpt_dir=training_args.ckpt_path, target=state)
+        print("state step", state.step)
+
     # Define gradient update step fn
     def train_step(state, batch, dropout_rng):
         dropout_rng, new_dropout_rng = jax.random.split(dropout_rng)
@@ -740,11 +762,14 @@ def main():
 
     p_eval_step = jax.pmap(eval_step, "batch", donate_argnums=(0,))
 
+    state_step = state.step
+    start_epoch = int((state_step * train_batch_size) // len(tokenized_datasets["train"]))
+
     # Replicate the train state on each device
     state = jax_utils.replicate(state)
 
     train_time = 0
-    epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0)
+    epochs = tqdm(range(start_epoch, num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0)
     for epoch in epochs:
         # ======================== Training ================================
         train_start = time.time()
@@ -758,8 +783,17 @@ def main():
         train_samples_idx = jax.random.permutation(input_rng, jnp.arange(num_train_samples))
         train_batch_idx = generate_batch_splits(train_samples_idx, train_batch_size)
 
+        start_step = 0
+        if epoch == start_epoch and state_step > 0:
+            num_step_per_epoch = num_train_samples // train_batch_size
+            start_step = state_step - epoch * num_step_per_epoch
+            remaining_num_step = num_step_per_epoch - start_step
+
+            train_batch_idx = train_batch_idx[:remaining_num_step]
+            print('remain_num_step', remaining_num_step, 'len', len(train_batch_idx))
+
         # Gather the indexes for creating the batch and do a training step
-        for step, batch_idx in enumerate(tqdm(train_batch_idx, desc="Training...", position=1)):
+        for step, batch_idx in enumerate(tqdm(train_batch_idx, desc="Training...", position=1), start=start_step):
             samples = [tokenized_datasets["train"][int(idx)] for idx in batch_idx]
             model_inputs = data_collator(samples, pad_to_multiple_of=16)
 
@@ -819,6 +853,8 @@ def main():
                     params = jax.device_get(jax.tree_map(lambda x: x[0], state.params))
                     model.save_pretrained(training_args.output_dir, params=params)
                     tokenizer.save_pretrained(training_args.output_dir)
+                    # SKY
+                    checkpoints.save_checkpoint(ckpt_dir='ckpts', target=jax_utils.unreplicate(state), step=cur_step)
                     if training_args.push_to_hub:
                         repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
 
